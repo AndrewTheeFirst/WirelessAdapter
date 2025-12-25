@@ -1,0 +1,6 @@
+*/components
+*/.devcontainer
+*/.vscode
+*/build
+*/managed_components
+*/unity-app
