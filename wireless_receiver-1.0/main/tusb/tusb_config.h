@@ -1,4 +1,5 @@
 #pragma once
+#include "usb_common.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -18,7 +19,7 @@ extern "C" {
 
 // Debug level (0=no debug, 1=errors, 2=warnings, 3=info)
 #ifndef CFG_TUSB_DEBUG
-#define CFG_TUSB_DEBUG            2  // Enable some debug output
+#define CFG_TUSB_DEBUG            2
 #endif
 
 // Alignment required by ESP-IDF
@@ -46,7 +47,7 @@ extern "C" {
 
 //------------- CLASS -------------//
 // We use two HID interfaces: mouse + keyboard
-#define CFG_TUD_HID               2
+#define CFG_TUD_HID               3
 #define CFG_TUD_CDC               0
 #define CFG_TUD_MSC               0
 #define CFG_TUD_MIDI              0

@@ -8,115 +8,120 @@
 #include "nvs_flash.h"
 #include "esp_private/usb_phy.h"
 #include "tusb.h"
-#include <string.h>
-#include "espnow_protocol.h"
+#include "msg_types.h"
+#include "tusb/usb_common.h"
 
-static const char *TAG = "usb_hid_bridge";
+#define KEYBOARD_QUEUE_SIZE 200
+#define MOUSE_QUEUE_SIZE 10
+#define GAMEPAD_QUEUE_SIZE 10
+
+static const char* TAG = "USB_RECEIVER";
+
 static usb_phy_handle_t phy_hdl = NULL;
 
-// Queue for ESP-NOW messages
-static QueueHandle_t espnow_queue = NULL;
-#define ESPNOW_QUEUE_SIZE 20
+static QueueHandle_t keyboard_queue = NULL;
+static QueueHandle_t mouse_queue = NULL;
+static QueueHandle_t gamepad_queue = NULL;
 
-// HID interface indices
-#define HID_ITF_MOUSE    0
-#define HID_ITF_KEYBOARD 1
+static TaskHandle_t keyboard_task_handle = NULL;
+static TaskHandle_t mouse_task_handle = NULL;
+static TaskHandle_t gamepad_task_handle = NULL;
 
-// ============== TinyUSB Task ==============
-static void tinyusb_device_task(void *arg)
+// HID Callbacks
+// Invoked when received GET_REPORT control request
+// Application must fill buffer report's content and return its length.
+// Return zero will cause the stack to STALL request
+// Leave empty, devices will send reports according to their polling rate
+uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t* buffer, uint16_t reqlen){
+    (void) instance;
+    (void) report_id;
+    (void) report_type;
+    (void) buffer;
+    (void) reqlen;
+    return 0;
+}
+
+// Invoked when received SET_REPORT control request or
+// received data on OUT endpoint ( Report ID = 0, Type = 0 )
+// ! ! ! TO IMPLEMENT ! ! !
+// Requires: Host -> Device Communication
+void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t const* buffer, uint16_t bufsize)
 {
-    ESP_LOGI(TAG, "TinyUSB device task started");
-    while (1) {
-        tud_task();
-        vTaskDelay(pdMS_TO_TICKS(1));
+    (void) instance;
+    (void) report_id;
+    (void) report_type;
+    (void) buffer;
+    (void) bufsize;
+}
+
+// Invoked when a HID report is completed
+// Notifies appropriate queue that their particular HID instance will be ready soon
+void tud_hid_report_complete_cb(uint8_t instance, uint8_t const* report, uint16_t len)
+{
+    (void)report;
+    (void)len;
+    
+    // Notify the appropriate task that USB is ready for next report
+    switch(instance) {
+        case HID_KEYBOARD_INSTANCE: 
+            if (keyboard_task_handle != NULL) {
+                xTaskNotifyGive(keyboard_task_handle);
+            }
+            break;
+        case HID_MOUSE_INSTANCE:
+            if (mouse_task_handle != NULL) {
+                xTaskNotifyGive(mouse_task_handle);
+            }
+            break;
+        case HID_GAMEPAD_INSTANCE:
+            if (gamepad_task_handle != NULL) {
+                xTaskNotifyGive(gamepad_task_handle);
+            }
+            break;
     }
 }
 
-// ============== ESP-NOW Callbacks ==============
-static void espnow_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t *data, int len)
-{
-    if (len < 1 || len > sizeof(espnow_message_t)) {
+// ESP-NOW Callbacks
+// ESP-NOW send callback -- invoked when data is sent
+// Receiver currently doesn't add a peer, and does not invoke this callback
+static void espnow_send_cb(const wifi_tx_info_t* tx_info, esp_now_send_status_t status){
+    (void)tx_info;
+    (void)status;
+}
+
+// ESP-NOW receive callback -- invoked when data is received
+// Routes messages to their repective queues
+static void espnow_recv_cb(const esp_now_recv_info_t* recv_info, const uint8_t* data, int len){
+    // Drop bad message format
+    if (len < 1 || len > sizeof(espnow_message_t))
         return;
-    }
-
-    espnow_message_t *msg = (espnow_message_t *)data;
-    
-    // Check if USB is mounted
-    if (! tud_mounted()) {
-        return;  // Drop if not connected
-    }
-    
-    // Process SIMPLE messages directly for minimum latency
+    // Drop if not connected
+    if (!tud_mounted())
+        return;
+    ESP_LOGI(TAG, "A message has been received.");
+    espnow_message_t* msg = (espnow_message_t*)data;
+    // Route message
     switch (msg->msg_type) {
-        case ESPNOW_MSG_MOUSE_MOVE:
-            // Fast path - process directly
-            if (tud_hid_n_ready(HID_ITF_MOUSE)) {
-                tud_hid_n_mouse_report(HID_ITF_MOUSE, 1, 
-                    msg->mouse_move. buttons,
-                    msg->mouse_move.dx,
-                    msg->mouse_move.dy,
-                    msg->mouse_move.wheel, 0);
-            }
-            // If not ready, drop it (mouse moves are continuous anyway)
+        case ESPNOW_MSG_MOUSE:
+            if (xQueueSend(mouse_queue, &msg->mouse_msg, 0) != pdTRUE)
+                ESP_LOGW(TAG, "Mouse queue full");
             break;
-            
-        case ESPNOW_MSG_KEYBOARD_PRESS:
-            // Fast path - process directly
-            if (tud_hid_n_ready(HID_ITF_KEYBOARD)) {
-                uint8_t keycodes[6] = {msg->keyboard_press.keycode, 0, 0, 0, 0, 0};
-                tud_hid_n_keyboard_report(HID_ITF_KEYBOARD, 2, 
-                    msg->keyboard_press. modifiers, keycodes);
-            } else {
-                // Key presses are important - queue if USB busy
-                espnow_message_t msg_copy;
-                memcpy(&msg_copy, msg, len);
-                xQueueSend(espnow_queue, &msg_copy, 0);
-            }
+        case ESPNOW_MSG_KEYBOARD:
+            if (xQueueSend(keyboard_queue, &msg->keyboard_msg, 0) != pdTRUE)
+                ESP_LOGW(TAG, "Keyboard queue full");
             break;
-            
-        case ESPNOW_MSG_KEYBOARD_RELEASE:
-            // Fast path - process directly
-            if (tud_hid_n_ready(HID_ITF_KEYBOARD)) {
-                uint8_t keycodes[6] = {0, 0, 0, 0, 0, 0};
-                tud_hid_n_keyboard_report(HID_ITF_KEYBOARD, 2, 0, keycodes);
-            } else {
-                // Queue if busy
-                espnow_message_t msg_copy;
-                memcpy(&msg_copy, msg, len);
-                xQueueSend(espnow_queue, &msg_copy, 0);
-            }
-            break;
-            
-        case ESPNOW_MSG_MOUSE_CLICK:
-        case ESPNOW_MSG_KEYBOARD_TYPE_STRING:
-            // COMPLEX messages - always queue (need delays, loops, etc.)
-            {
-                espnow_message_t msg_copy;
-                memcpy(&msg_copy, msg, len);
-                xQueueSend(espnow_queue, &msg_copy, 0);
-            }
-            break;
-            
-        default:
+        case ESPNOW_MSG_GAMEPAD:
+            if (xQueueSend(gamepad_queue, &msg->gamepad_msg, 0) != pdTRUE)
+                ESP_LOGW(TAG, "Gamepad queue full");
             break;
     }
 }
 
-static void espnow_send_cb(const wifi_tx_info_t *tx_info, esp_now_send_status_t status)
-{
-    (void)tx_info;  // Unused in receiver
-    (void)status;   // Unused in receiver
-    
-    // Receiver typically doesn't send, so this might never be called
-    // But we need it registered anyway
-}
-
-// ============== ESP-NOW Initialization ==============
-static esp_err_t init_espnow(void)
-{
+// Initializes NVS, WIFI, and ESP-NOW w/ callbacks
+static void init_espnow(void){
     ESP_LOGI(TAG, "Initializing ESP-NOW...");
     
-    // Initialize NVS
+    // Initialize NVS (not used, but satisfies ESP-NOW)
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -133,226 +138,203 @@ static esp_err_t init_espnow(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
     
-    // Set long range mode (optional, better range but lower speed)
+    // Set long range mode (better range at the cost of speed)
     ESP_ERROR_CHECK(esp_wifi_set_protocol(ESP_IF_WIFI_STA, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N|WIFI_PROTOCOL_LR));
     
-    // Initialize ESP-NOW
+    // Initialize ESP-NOW & Register Callbacks
     ESP_ERROR_CHECK(esp_now_init());
     ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_recv_cb));
     ESP_ERROR_CHECK(esp_now_register_send_cb(espnow_send_cb));
-    
-    // Print MAC address
-    uint8_t mac[6];
-    esp_wifi_get_mac(ESP_IF_WIFI_STA, mac);
-    ESP_LOGI(TAG, "ESP-NOW initialized.  MAC: %02X:%02X:%02X:%02X:%02X:%02X",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    
-    return ESP_OK;
 }
 
-// ============== HID Action Handlers ==============
-static void handle_mouse_move(const espnow_mouse_move_t *msg) __attribute__((unused));
-
-static void handle_mouse_move(const espnow_mouse_move_t *msg)
-{
-    // ... implementation ...
-}
-
-static void handle_mouse_click(const espnow_mouse_click_t *msg)
-{
-    if (!tud_mounted() || !tud_hid_n_ready(HID_ITF_MOUSE)) {
-        return;
-    }
-    
-    // Press
-    tud_hid_n_mouse_report(HID_ITF_MOUSE, 1, msg->buttons, 0, 0, 0, 0);
-    vTaskDelay(pdMS_TO_TICKS(msg->duration_ms));
-    
-    // Release
-    tud_hid_n_mouse_report(HID_ITF_MOUSE, 1, 0, 0, 0, 0, 0);
-}
-
-static void handle_keyboard_press(const espnow_keyboard_press_t *msg)
-{
-    if (!tud_mounted()) {
-        return;
-    }
-    
-    // Wait for interface to be ready with timeout
-    uint32_t timeout = 10;  // 10ms max wait
-    while (!tud_hid_n_ready(HID_ITF_KEYBOARD) && timeout-- > 0) {
+// Task to process and deliver USB events to host
+// tud_task() wrapper to control polling rate
+static void tinyusb_device_task(void* arg){
+    ESP_LOGI(TAG, "TinyUSB device task started");
+    while (true) {
+        tud_task();
         vTaskDelay(pdMS_TO_TICKS(1));
     }
-    
-    if (! tud_hid_n_ready(HID_ITF_KEYBOARD)) {
-        ESP_LOGW(TAG, "Keyboard not ready, dropping press");
-        return;
-    }
-    
-    uint8_t keycodes[6] = {msg->keycode, 0, 0, 0, 0, 0};
-    tud_hid_n_keyboard_report(HID_ITF_KEYBOARD, 2, msg->modifiers, keycodes);
-    
-    // Small delay to ensure USB transaction completes
-    vTaskDelay(pdMS_TO_TICKS(2));  // 2ms safety buffer
 }
 
-static void handle_keyboard_release(const espnow_keyboard_release_t *msg)
-{
-    if (!tud_mounted()) {
-        return;
-    }
-    
-    uint32_t timeout = 10;
-    while (!tud_hid_n_ready(HID_ITF_KEYBOARD) && timeout-- > 0) {
-        vTaskDelay(pdMS_TO_TICKS(1));
-    }
-    
-    if (!tud_hid_n_ready(HID_ITF_KEYBOARD)) {
-        ESP_LOGW(TAG, "Keyboard not ready, dropping release");
-        return;
-    }
-    
-    uint8_t keycodes[6] = {0, 0, 0, 0, 0, 0};
-    tud_hid_n_keyboard_report(HID_ITF_KEYBOARD, 2, 0, keycodes);
-    
-    vTaskDelay(pdMS_TO_TICKS(2));  // 2ms safety buffer
-}
-
-static void handle_keyboard_string(const espnow_keyboard_string_t *msg)
-{
-    if (!tud_mounted() || !tud_hid_n_ready(HID_ITF_KEYBOARD)) {
-        return;
-    }
-    
-    ESP_LOGI(TAG, "Typing string: %.*s", msg->length, msg->text);
-    
-    for (int i = 0; i < msg->length; i++) {
-        char c = msg->text[i];
-        uint8_t keycode = 0;
-        uint8_t modifier = 0;
-        
-        // Simple ASCII to HID keycode conversion (expand as needed)
-        if (c >= 'a' && c <= 'z') {
-            keycode = HID_KEY_A + (c - 'a');
-        } else if (c >= 'A' && c <= 'Z') {
-            keycode = HID_KEY_A + (c - 'A');
-            modifier = KEYBOARD_MODIFIER_LEFTSHIFT;
-        } else if (c == ' ') {
-            keycode = HID_KEY_SPACE;
-        } else if (c >= '0' && c <= '9') {
-            keycode = HID_KEY_0 + (c - '0');
+// HID Tasks to service message queue, once notified by tud_hid_report_complete_cb()
+static void keyboard_task(void* arg){
+    espnow_msg_keyboard_t msg;
+    ESP_LOGI(TAG, "Keyboard task started");
+    while (true) {
+        // Suspends task to wait for keyboard message to arrive in queue
+        // returns pdTRUE if msg is retrieved from the queue successfully
+        if (xQueueReceive(keyboard_queue, &msg, portMAX_DELAY) != pdTRUE) {
+            continue;
         }
-        // Add more character mappings as needed... 
         
-        if (keycode != 0) {
-            uint8_t keycodes[6] = {keycode, 0, 0, 0, 0, 0};
-            
-            // Press
-            tud_hid_n_keyboard_report(HID_ITF_KEYBOARD, 2, modifier, keycodes);
-            vTaskDelay(pdMS_TO_TICKS(20));
-            
-            // Release
-            memset(keycodes, 0, sizeof(keycodes));
-            tud_hid_n_keyboard_report(HID_ITF_KEYBOARD, 2, 0, keycodes);
-            vTaskDelay(pdMS_TO_TICKS(20));
+        // Check if USB is mounted
+        if (!tud_mounted()) {
+            ESP_LOGW(TAG, "USB not mounted, dropping keyboard message");
+            continue;
         }
-    }
-}
-
-// ============== ESP-NOW Message Handler Task ==============
-static void espnow_handler_task(void *arg)
-{
-    espnow_message_t msg;
-    
-    ESP_LOGI(TAG, "ESP-NOW handler task started");
-    
-    while (1) {
-        // Wait for messages that were queued
-        if (xQueueReceive(espnow_queue, &msg, portMAX_DELAY) == pdTRUE) {
+        
+        // Wait for USB to be ready
+        while (!tud_hid_n_ready(HID_KEYBOARD_INSTANCE)) {
+            // Sleep until USB callback wakes us (or wait 100MS)
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
             
-            if (! tud_mounted()) {
-                continue;
-            }
-            
-            switch (msg.msg_type) {
-                case ESPNOW_MSG_MOUSE_CLICK:
-                    handle_mouse_click(&msg.mouse_click);
-                    break;
-                    
-                case ESPNOW_MSG_KEYBOARD_TYPE_STRING:
-                    handle_keyboard_string(&msg.keyboard_string);
-                    break;
-                    
-                case ESPNOW_MSG_KEYBOARD_PRESS:
-                    // Queued because USB was busy - process with safety
-                    handle_keyboard_press(&msg.keyboard_press);
-                    break;
-                    
-                case ESPNOW_MSG_KEYBOARD_RELEASE:
-                    // Queued because USB was busy - process with safety
-                    handle_keyboard_release(&msg. keyboard_release);
-                    break;
-                    
-                default:
-                    ESP_LOGW(TAG, "Unknown queued message: 0x%02X", msg.msg_type);
-                    break;
+            // Check if still mounted after waiting
+            if (!tud_mounted()) {
+                break;
             }
         }
+        
+        // Send the report
+        if (tud_mounted() && tud_hid_n_ready(HID_KEYBOARD_INSTANCE)){
+            tud_hid_n_keyboard_report(
+                HID_KEYBOARD_INSTANCE,
+                HID_KEYBOARD_REPORT_ID,
+                msg.modifiers,
+                msg.keys
+            );
+        }
+        else {
+            ESP_LOGW(TAG, "Keyboard timeout, dropping message");
+        }
     }
 }
 
-// ============== Main ==============
-void app_main(void)
-{
-    ESP_LOGI(TAG, "=== USB HID Bridge with ESP-NOW ===");
-    
-    // Initialize USB PHY
+static void mouse_task(void* arg){
+    espnow_msg_mouse_t msg;
+    ESP_LOGI(TAG, "Mouse task started");
+    while (true) {
+        // Suspends task to wait for mouse message to arrive in queue
+        // returns pdTRUE if msg is retrieved from the queue successfully
+        if (xQueueReceive(mouse_queue, &msg, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        
+        // Check if USB is mounted
+        if (!tud_mounted()) {
+            ESP_LOGW(TAG, "USB not mounted, dropping mouse message");
+            continue;
+        }
+        
+        // Wait for USB to be ready
+        while (!tud_hid_n_ready(HID_MOUSE_INSTANCE)) {
+            // Sleep until USB callback wakes us (or wait 100MS)
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
+            
+            // Check if still mounted after waiting
+            if (!tud_mounted()) {
+                break;
+            }
+        }
+        
+        // Send the report
+        if (tud_mounted() && tud_hid_n_ready(HID_MOUSE_INSTANCE)){
+            tud_hid_n_mouse_report(
+                HID_MOUSE_INSTANCE,
+                HID_MOUSE_REPORT_ID,
+                msg.buttons,
+                msg.x,
+                msg.y,
+                msg.wheel,
+                msg.pan
+            );
+        }
+        else {
+            ESP_LOGW(TAG, "Mouse timeout, dropping message");
+        }
+    }
+}
+
+static void gamepad_task(void* arg){
+    espnow_msg_gamepad_t msg;
+    ESP_LOGI(TAG, "Gamepad task started");
+    while (true) {
+        // Suspends task to wait for gampad message to arrive in queue
+        // returns pdTRUE if msg is retrieved from the queue successfully
+        if (xQueueReceive(gamepad_queue, &msg, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        
+        // Check if USB is mounted
+        if (!tud_mounted()) {
+            ESP_LOGW(TAG, "USB not mounted, dropping gamepad message");
+            continue;
+        }
+        
+        // Wait for USB to be ready
+        while (!tud_hid_n_ready(HID_GAMEPAD_INSTANCE)) {
+            // Sleep until USB callback wakes us (or wait 100MS)
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
+            
+            // Check if still mounted after waiting
+            if (!tud_mounted()) {
+                break;
+            }
+        }
+        
+        // Send the report
+        if (tud_mounted() && tud_hid_n_ready(HID_GAMEPAD_INSTANCE)){
+            tud_hid_n_gamepad_report(
+                HID_GAMEPAD_INSTANCE,
+                HID_GAMEPAD_REPORT_ID,
+                msg.x,
+                msg.y,
+                msg.z,
+                msg.rz,
+                msg.rx,
+                msg.ry,
+                msg.hat,
+                msg.buttons
+            );
+        }
+        else {
+            ESP_LOGW(TAG, "Gamepad timeout, dropping message");
+        }
+    }
+}
+
+// Initialize program & begins mainloop
+void app_main(void){
+    // Initialize USB Hardware Configuration
     ESP_LOGI(TAG, "Initializing USB PHY...");
     usb_phy_config_t phy_config = {
-        .controller = USB_PHY_CTRL_OTG,
-        .target = USB_PHY_TARGET_INT,
-        .otg_mode = USB_OTG_MODE_DEVICE,
-        .otg_speed = USB_PHY_SPEED_FULL,
-        .ext_io_conf = NULL,
-        .otg_io_conf = NULL,
-    };
+        .controller     = USB_PHY_CTRL_OTG,
+        .target         = USB_PHY_TARGET_INT,
+        .otg_mode       = USB_OTG_MODE_DEVICE,
+        .otg_speed      = USB_PHY_SPEED_FULL,
+        .ext_io_conf    = NULL,
+        .otg_io_conf    = NULL};
     ESP_ERROR_CHECK(usb_new_phy(&phy_config, &phy_hdl));
-    
-    // Initialize TinyUSB
+
+    // Initialize & Start TUSB-Device
     ESP_LOGI(TAG, "Initializing TinyUSB...");
-    if (! tusb_init()) {
-        ESP_LOGE(TAG, "TinyUSB init failed!");
+    if (!tusb_init()) {
+        ESP_LOGE(TAG, "Failed to initialize TinyUSB.");
         return;
     }
-    
-    // Start TinyUSB task
-    xTaskCreatePinnedToCore(tinyusb_device_task, "tud_task", 4096, NULL, 5, NULL, 0);
-    
+    xTaskCreatePinnedToCore(tinyusb_device_task, "tud_task", 4096, NULL, 6, NULL, 0);
+
     // Initialize ESP-NOW
-    ESP_ERROR_CHECK(init_espnow());
+    init_espnow();
+
+    ESP_LOGI(TAG, "Creating message queues...");
+    keyboard_queue = xQueueCreate(KEYBOARD_QUEUE_SIZE, sizeof(espnow_msg_keyboard_t));
+    mouse_queue = xQueueCreate(MOUSE_QUEUE_SIZE, sizeof(espnow_msg_mouse_t));
+    gamepad_queue = xQueueCreate(GAMEPAD_QUEUE_SIZE, sizeof(espnow_msg_gamepad_t));
     
-    // Create message queue
-    espnow_queue = xQueueCreate(ESPNOW_QUEUE_SIZE, sizeof(espnow_message_t));
-    if (espnow_queue == NULL) {
-        ESP_LOGE(TAG, "Failed to create ESP-NOW queue");
+    if (!keyboard_queue || !mouse_queue || !gamepad_queue) {
+        ESP_LOGE(TAG, "Failed to create queues!");
         return;
     }
-    
-    // Start ESP-NOW handler task
-    xTaskCreate(espnow_handler_task, "espnow_handler", 4096, NULL, 7, NULL);
-    
+
+    xTaskCreate(keyboard_task, "keyboard", 3072, NULL, 5, &keyboard_task_handle);
+    xTaskCreate(mouse_task, "mouse", 3072,      NULL, 5, &mouse_task_handle);
+    xTaskCreate(gamepad_task, "gamepad", 3072, NULL, 4, &gamepad_task_handle);
+
     // Wait for USB mount
     ESP_LOGI(TAG, "Waiting for USB to mount...");
     while (!tud_mounted()) {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
-    ESP_LOGI(TAG, "USB mounted!  Ready to receive ESP-NOW commands.");
-    
-    // Main loop - just monitor status
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(5000));
-        ESP_LOGI(TAG, "Status: USB %s, Queue: %d messages",
-                 tud_mounted() ? "connected" : "disconnected",
-                 uxQueueMessagesWaiting(espnow_queue));
-    }
+    ESP_LOGI(TAG, "USB mounted! Device is ready.");
 }
