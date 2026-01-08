@@ -3,7 +3,7 @@ dependencies:
   ## Required IDF version
   idf:
     version: ">=4.1.0"
-  espressif/tinyusb: "~0.15.0"
+  usb_host_hid: "^1.0.1"
   usb: "*"
   # # Put list of dependencies here
   # # For components maintained by Espressif:

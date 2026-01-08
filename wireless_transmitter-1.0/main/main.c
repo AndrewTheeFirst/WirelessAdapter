@@ -1,28 +1,60 @@
+// OS 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_err.h"
+
+// ESP-NOW
 #include "esp_wifi.h"
 #include "esp_now.h"
-#include "esp_mac.h"
 #include "nvs_flash.h"
-#include "driver/gpio.h"
-#include "esp_private/usb_phy.h"
-#include "tusb.h"
 #include "msg_types.h"
 
-#define BUTTON_1_GPIO 17
-#define BUTTON_2_GPIO 6
+// USB
+#include "esp_private/usb_phy.h"
+#include "usb/usb_host.h"
+#include "usb/hid_host.h"
+#include "usb/hid_usage_keyboard.h"
+#include "usb/hid_usage_mouse.h"
+#include "controller_usage.h"
+
+// OTHER
+#include <string.h>
+
+#define DEBUG_HID 1
+#define DEBUG_WIFI 0
+
+#define HID_INTERFACE_PROTOCOL_NONE     0
+#define HID_INTERFACE_PROTOCOL_KEYBOARD 1
+#define HID_INTERFACE_PROTOCOL_MOUSE    2
+
+#define LEN_MIN_MOUSE_REP (sizeof(hid_mouse_input_report_boot_t))
+#define LEN_STD_MOUSE_REP 4
+#define LEN_HIGH_PRECSICION_MOUSE_REP 6
 
 static const char* TAG = "USB_TRANSMITTER";
-// static usb_phy_handle_t phy_hdl = NULL;
-static uint8_t receiver_mac[6] = {0x10, 0x20, 0xBA, 0x4D, 0x3D, 0xCC};
+static const uint8_t receiver_mac[6] = {0x10, 0x20, 0xBA, 0x4D, 0x3D, 0xCC};
 
+static hid_host_device_handle_t keyboard_handle = NULL;
+static hid_host_device_handle_t mouse_handle = NULL;
+static hid_host_device_handle_t generic_handle = NULL;
+controller_type_t controller_type = CONTROLLER_TYPE_UNKNOWN;
+
+TaskHandle_t kbd_wd_task_handle = NULL;
+
+static void process_keyboard_report(const uint8_t *data, size_t length);
+static void process_mouse_report(const uint8_t *data, size_t length);
+static void process_gamepad_report(const uint8_t *data, size_t length);
+
+// ========= WIFI =========
 static void espnow_send_cb(const wifi_tx_info_t* tx_info, esp_now_send_status_t status){
+    #if DEBUG_WIFI
     if (status != ESP_NOW_SEND_SUCCESS){
         ESP_LOGW(TAG, "Send failed to %02X:%02X:%02X:%02X:%02X:%02X",
             tx_info->des_addr[0], tx_info->des_addr[1], tx_info->des_addr[2],
             tx_info->des_addr[3], tx_info->des_addr[4], tx_info->des_addr[5]);
     }
+    #endif
 }
 
 // Receiver currently doesn't receive, but ESP-NOW wants CB registered.
@@ -71,151 +103,308 @@ static void init_espnow(void){
     ESP_ERROR_CHECK(esp_now_add_peer(&peer_info));
 }
 
-static void tinyusb_host_task(void* arg){
-    ESP_LOGI(TAG, "TinyUSB Host task started");
-    while (true) {
-        tuh_task();
-        vTaskDelay(pdMS_TO_TICKS(1));
-    }
-}
 
-static void send_keyboard_msg(uint8_t modifiers, uint8_t keys[6]){
+// ========= HID Report Handling =========
+typedef struct {
+    bool active;
+    uint32_t last_report_time;
+} keyboard_watchdog_t;
+
+static keyboard_watchdog_t kbd_wd = {0};
+
+// Formats and sends esp-now keyboard message to receiver
+// Watches for macros and enables watchdog to prevent "stuck" modifiers
+static void process_keyboard_report(const uint8_t* data, size_t length) {
+    // handle malformed report 
+    if (length < sizeof(hid_keyboard_input_report_boot_t))
+        return;
+
+    // Convert data to standard report format
+    const hid_keyboard_input_report_boot_t* report = (hid_keyboard_input_report_boot_t*)data;
+
+    // Fill message and send
     espnow_msg_keyboard_t msg = {
         .msg_type = ESPNOW_MSG_KEYBOARD,
-        .modifiers = modifiers,
+        .modifiers = report->modifier.val,
+        .reserved = 0
+    };
+    memcpy(msg.keys, report->key, sizeof(report->key));
+    esp_now_send(receiver_mac, (uint8_t*)&msg, sizeof(msg));
+
+    uint32_t curr_time_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    // enable watchdog if modifier is sent
+    if (report->modifier.val != 0){
+        if (!kbd_wd.active) {
+            ESP_LOGI(TAG, "kbd_wd: Watchdog Activated -> mod=0x%02X", report->modifier.val);
+            kbd_wd.active = true;
+            xTaskNotifyGive(kbd_wd_task_handle);
+        }
+    }
+    // disable watchdog if report has no modifier, if enabled
+    else if (kbd_wd.active) {
+        ESP_LOGI(TAG, "kbd_wd: Watchdog Deactivated");
+        kbd_wd.active = false;
+    }
+    kbd_wd.last_report_time = curr_time_ms;
+}
+
+// Task to clear "stuck" macros commonly sent by composite devices.
+void keyboard_watchdog_task(void *arg) {
+    espnow_msg_keyboard_t release = {
+        .msg_type = ESPNOW_MSG_KEYBOARD,
+        .modifiers = 0,
         .reserved = 0,
-        .keys = {keys[0], keys[1], keys[2], keys[3], keys[4], keys[5]}
+        .keys = {0, 0, 0, 0, 0, 0}
     };
-    esp_now_send(receiver_mac, (uint8_t*)&msg, sizeof(msg));
-}
+    while (true) {
+        // Wait until watchdog is activated
+        if (!kbd_wd.active){
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
 
-static void send_mouse_msg(uint8_t buttons, int8_t dx, int8_t dy, int8_t wheel, int8_t pan){
-    espnow_msg_mouse_t msg = {
-        .msg_type = ESPNOW_MSG_MOUSE,
-        .buttons = buttons,
-        .x = dx,
-        .y = dy,
-        .wheel = wheel,
-        .pan = pan,
-    };
-    esp_now_send(receiver_mac, (uint8_t*)&msg, sizeof(msg));
-}
-
-static void send_gamepad_msg(int8_t ldx, int8_t ldy, int8_t rdx, int8_t rdy, int8_t ltrig, int8_t rtrig, uint8_t dpad, uint8_t buttons){
-    espnow_msg_gamepad_t msg = {
-        .msg_type = ESPNOW_MSG_GAMEPAD,
-        .x = ldx,
-        .y = ldy,
-        .z = rdx,
-        .rz = rdy,
-        .rx = ltrig,
-        .ry = rtrig,
-        .hat = dpad,
-        .buttons = buttons
-    };
-    esp_now_send(receiver_mac, (uint8_t*)&msg, sizeof(msg));
-}
-
-static void send_keyboard_msg_string(const char* message){
-    uint8_t const conv_table[128][2] =  { HID_ASCII_TO_KEYCODE };
-    for (int index = 0; index < strlen(message); index++){
-        uint8_t chr = (uint8_t)message[index];
-        uint8_t modifier = 0;
-        uint8_t keycode[6] = {0};
-        if (conv_table[chr][0])
-            modifier = KEYBOARD_MODIFIER_LEFTSHIFT;
-        keycode[0] = conv_table[chr][1];
-        send_keyboard_msg(modifier, keycode);
-        vTaskDelay(pdMS_TO_TICKS(10));
-        uint8_t clear[6] = {0, 0, 0, 0, 0, 0};
-        send_keyboard_msg(0, clear);
-        vTaskDelay(pdMS_TO_TICKS(10));
+        // If keyboard disconnects, disable kbd_wd and send keyboard release 
+        if (keyboard_handle == NULL) {
+            ESP_LOGW(TAG, "kbd_wd: Keyboard has disconnected - auto-releasing");
+            kbd_wd.active = false;
+            esp_now_send(receiver_mac, (uint8_t*)&release, sizeof(release));
+            continue;
+        }
+        
+        uint32_t curr_time_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        uint32_t idle_time = curr_time_ms - kbd_wd.last_report_time;
+        // fire watchdog if time between last report and macro longer than 200ms
+        if (idle_time >= 200) {
+            ESP_LOGW(TAG, "kbd_wd: Modifier combo timeout %dms - auto-releasing", idle_time);
+            kbd_wd.active = false;
+            esp_now_send(receiver_mac, (uint8_t*)&release, sizeof(release));
+        }
     }
 }
 
-static void init_buttons(void){
-    gpio_config_t io_conf = {
-        .pin_bit_mask = ((1ULL << BUTTON_1_GPIO) | (1ULL << BUTTON_2_GPIO)),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&io_conf);
-    ESP_LOGI(TAG, "Buttons initialized on GPIO %d and %d", BUTTON_1_GPIO, BUTTON_2_GPIO);
-}
+static inline int8_t clamp16to8(int16_t val) { return (val < -128) ? -128 : ((val > 127) ? 127 : val); }
 
-static void button_task(void* arg){
-    uint8_t KEY_A[6] = {HID_KEY_A, 0, 0, 0, 0, 0};
-    uint8_t CLEAR[6] = {0, 0, 0, 0, 0, 0};
+// Formats and sends esp-now mouse message to receiver.
+static void process_mouse_report(const uint8_t* data, size_t length) {
     
-    init_buttons();
+    if (length < LEN_MIN_MOUSE_REP)
+        return;
+    espnow_msg_mouse_t msg;
+    if (length  <= LEN_STD_MOUSE_REP){
+        const hid_mouse_input_report_boot_t* report = (hid_mouse_input_report_boot_t*)data;
 
-    // Track button states for edge detection
-    bool button1_prev = false;  // true = not pressed (pull-up)
-    bool button2_prev = false;
+        // Fill message
+        msg.msg_type    = ESPNOW_MSG_MOUSE;
+        msg.buttons     = report->buttons.val;
+        msg.x           = report->x_displacement;
+        msg.y           = report->y_displacement;
+        msg.wheel       = (length == LEN_MIN_MOUSE_REP) ? 0 : data[3];
+        msg.pan         = (length >  LEN_STD_MOUSE_REP) ? data[4] : 0;
+    }
+    else if (length >= LEN_HIGH_PRECSICION_MOUSE_REP) {
+        // Bytes are little endian
+        // Second byte contains signed bit.
+        int16_t dx = (int16_t)((uint16_t)data[1] | ((int16_t)data[2] << 8));
+        // Repeat for dy
+        int16_t dy = (int16_t)((uint16_t)data[3] | ((int16_t)data[4] << 8));
 
-    while (true){
-        // Read current button states (LOW = pressed with pull-up)
-        bool button1_current = gpio_get_level(BUTTON_1_GPIO);
-        bool button2_current = gpio_get_level(BUTTON_2_GPIO);
-        
-        // Button 1 - Send 'A' key
-        if (button1_current && !button1_prev){
-            // Button pressed (falling edge)
-            ESP_LOGI(TAG, "Button 1 pressed - Sending 'A'");
-            send_keyboard_msg(0, KEY_A);
-        }
-        else if (!button1_current && button1_prev){
-            // Button released (rising edge)
-            ESP_LOGI(TAG, "Button 1 released");
-            send_keyboard_msg(0, CLEAR);
-        }
-        
-        // Button 2 - Send Message
-        if (button2_current && !button2_prev){
-            // Button pressed (falling edge)
-            ESP_LOGI(TAG, "Button 2 pressed - Sending Secret Message");
-            send_keyboard_msg_string("This is a message to test the speed capabilities of the receiver.\nThis message is being sent at approximatly 1200wpm.");
-        } 
-        else if (!button2_current && button2_prev){
-            // Button released (rising edge)
-            ESP_LOGI(TAG, "Button 2 released");
-            send_keyboard_msg(0, CLEAR);
-        }
-        
-        // Update previous states
-        button1_prev = button1_current;
-        button2_prev = button2_current;
-        
-        // Poll every 10ms (100Hz)
-        vTaskDelay(pdMS_TO_TICKS(10));
+        // Fill message
+        msg.msg_type    = ESPNOW_MSG_MOUSE;
+        msg.buttons     = data[0];
+        msg.x           = clamp16to8(dx); // Clamp to 8 bits
+        msg.y           = clamp16to8(dy); // Clamp to 8 bits
+        msg.wheel       = data[5];
+        msg.pan         = (length == LEN_HIGH_PRECSICION_MOUSE_REP) ? 0 : data[6];
+    }
+    // Send Message to Receiver
+    esp_now_send(receiver_mac, (uint8_t*)&msg, sizeof(msg));
+}
+
+static void process_gamepad_report(const uint8_t* data, size_t length) {
+    // TODO . . .
+}
+
+#if 0
+#define SAITEK_LS_DX (data[1] - 0x80)
+#define SAITEK_LS_DY (data[2] - 0x80)
+#define SAITEK_LR_DX (data[3] - 0x80)
+#define SAITEK_LR_DY (data[4] - 0x80)
+
+static void process_gamepad_report(const uint8_t* data, size_t length) {
+    espnow_msg_gamepad_t msg;
+    switch(controller_type){
+        case CONTROLLER_TYPE_SAITEK:
+        case CONTROLLER_TYPE_SAITEK_P2500:
+
+            const saitek_controller_report* report = (saitek_controller_report*)(data);
+            msg.msg_type = ESPNOW_MSG_GAMEPAD;
+            // msg.x = (int8_t)(report->lt_joystk_hor - 0x80);
+            // msg.y = (int8_t)(report->lt_joystk_vert - 0x80);
+            // msg.z = (int8_t)(report->rt_joystk_hor - 0x80);
+            // msg.rz = (int8_t)(report->rt_joystk_vert - 0x80);
+            msg.x = SAITEK_LS_DX;
+            msg.y = SAITEK_LS_DY;
+            msg.z = SAITEK_LR_DX;
+            msg.rz = SAITEK_LR_DY;
+            msg.rx = 0;
+            msg.ry = 0;
+            msg.hat = convert_saitek_hat(report->special & 0xF0);
+            msg.buttons = convert_saitek_buttons(report->buttons, report->special);
+            break;
+        default:
+            break;
+    }
+    ESP_LOGI(TAG, "Gamepad Message Sent");
+    esp_now_send(receiver_mac, (uint8_t*)&msg, sizeof(msg));
+}
+#endif
+
+// ========= USB SETUP =========
+// Event-loop to register Callbacks, Handle Enumeration, and enable the processing of HID Events 
+static void usb_host_lib_task(void *arg) {
+    while (true) {
+        uint32_t event_flags;
+        usb_host_lib_handle_events(portMAX_DELAY, &event_flags);
     }
 }
+
+// Route HID reports and handle various HID events.
+// Invoked on receiving an HID report or device disconnect
+static void hid_host_interface_callback(hid_host_device_handle_t hid_device_handle, const hid_host_interface_event_t event, void* arg){
+    uint8_t data[32];
+    size_t data_length = 0;
+    
+    switch (event) {
+        case HID_HOST_INTERFACE_EVENT_INPUT_REPORT:
+            // Get the input report
+            ESP_ERROR_CHECK(hid_host_device_get_raw_input_report_data(hid_device_handle, data, sizeof(data), &data_length));
+            
+            // Determine device type and process
+            if (hid_device_handle == keyboard_handle){
+                process_keyboard_report(data, data_length);
+            }
+            else if (hid_device_handle == mouse_handle) {
+                process_mouse_report(data, data_length);
+            }
+            else if (hid_device_handle == generic_handle) {
+                process_gamepad_report(data, data_length);
+            }
+            #if DEBUG_HID
+            ESP_LOGI(TAG, "HID Device: (%s) Report Length: (%d bytes): {%02X, %02X, %02X, %02X, %02X, %02X, %02X, %02X}", 
+                (hid_device_handle == keyboard_handle) ? "Keyboard" : ((hid_device_handle == mouse_handle) ? "Mouse" : get_type_name(controller_type)),
+                data_length, 
+                (data_length > 0) ? data[0] : 0,
+                (data_length > 1) ? data[1] : 0,
+                (data_length > 2) ? data[2] : 0,
+                (data_length > 3) ? data[3] : 0,
+                (data_length > 4) ? data[4] : 0,
+                (data_length > 5) ? data[5] : 0,
+                (data_length > 6) ? data[6] : 0,
+                (data_length > 7) ? data[7] : 0
+            );
+            #endif
+            break;
+            
+        case HID_HOST_INTERFACE_EVENT_DISCONNECTED:
+            ESP_LOGI(TAG, "HID Device disconnected");
+            if (hid_device_handle == keyboard_handle)
+                keyboard_handle = NULL;
+            if (hid_device_handle == mouse_handle)
+                mouse_handle= NULL;
+            if (hid_device_handle == generic_handle)
+                generic_handle = NULL;
+            hid_host_device_close(hid_device_handle);
+            break;
+            
+        case HID_HOST_INTERFACE_EVENT_TRANSFER_ERROR:
+            ESP_LOGW(TAG, "HID transfer error");
+            break;
+    }
+}
+
+static void hid_host_device_callback(hid_host_device_handle_t hid_device_handle, const hid_host_driver_event_t event, void* arg){
+    switch (event) {
+        case HID_HOST_DRIVER_EVENT_CONNECTED:
+            // Allow time for stabilization
+            ESP_LOGI(TAG, "HID Device connected");
+            
+            // Get device parameters to determine type
+            hid_host_dev_params_t dev_params;
+            esp_err_t err = hid_host_device_get_params(hid_device_handle, &dev_params);
+            
+            if (err == ESP_OK) {
+                // Assign handle based on protocol
+                switch (dev_params.proto) {
+                    case HID_INTERFACE_PROTOCOL_KEYBOARD: 
+                        ESP_LOGI(TAG, "Keyboard detected");
+                        keyboard_handle = hid_device_handle;
+                        break;
+                        
+                    case HID_INTERFACE_PROTOCOL_MOUSE: 
+                        ESP_LOGI(TAG, "Mouse detected");
+                        mouse_handle = hid_device_handle;
+                        break;
+                        
+                    case HID_INTERFACE_PROTOCOL_NONE: 
+                    default:
+                        hid_host_dev_info_t dev_info;
+                        if (hid_host_get_device_info(hid_device_handle, &dev_info) == ESP_OK) {
+                            #if DEBUG_HID
+                            ESP_LOGI(TAG, "VID:  0x%04X, PID: 0x%04X", dev_info.VID, dev_info.PID);
+                            ESP_LOGI(TAG, "Manufacturer: %ls", dev_info.iManufacturer);
+                            ESP_LOGI(TAG, "Product: %ls", dev_info.iProduct);
+                            #endif
+                            identify_controller(dev_info.VID, dev_info.PID, &controller_type);
+                        }
+                        generic_handle = hid_device_handle;
+                        break;
+                }
+            }
+            else {
+                ESP_LOGW(TAG, "Failed to get device params: %s", esp_err_to_name(err));
+                generic_handle = hid_device_handle;
+            }
+            
+            // Configure interface callback
+            const hid_host_device_config_t dev_config = {
+                .callback = hid_host_interface_callback,
+                .callback_arg = NULL
+            };
+            
+            // Open and start device
+            ESP_ERROR_CHECK(hid_host_device_open(hid_device_handle, &dev_config));
+            ESP_ERROR_CHECK(hid_host_device_start(hid_device_handle));
+            break;
+        default: 
+            break;
+    }
+}
+
 
 void app_main(void){
-    // // Initialize USB Hardware Configuration
-    // ESP_LOGI(TAG, "Initializing USB PHY...");
-    // usb_phy_config_t phy_config = {
-    //     .controller = USB_PHY_CTRL_OTG,
-    //     .target = USB_PHY_TARGET_INT,
-    //     .otg_mode = USB_OTG_MODE_HOST,
-    //     .otg_speed = USB_PHY_SPEED_FULL,
-    //     .ext_io_conf = NULL,
-    //     .otg_io_conf = NULL};
-    // ESP_ERROR_CHECK(usb_new_phy(&phy_config, &phy_hdl));
+    // Initialize USB Phy, Install Host Driver
+    // Sets GPIO 19 & 20 as D+/D-
+    const usb_host_config_t host_config = {
+        .skip_phy_setup = false,
+        .intr_flags = ESP_INTR_FLAG_LEVEL1,
+    };
+    ESP_ERROR_CHECK(usb_host_install(&host_config));
 
-    //     // Initialize & Start TUSB-Host
-    // ESP_LOGI(TAG, "Initializing TinyUSB...");
-    // if (!tusb_init()) {
-    //     ESP_LOGE(TAG, "Failed to initialize TinyUSB.");
-    //     return;
-    // }
-    // xTaskCreatePinnedToCore(tinyusb_host_task, "tuh_task", 4096, NULL, 5, NULL, 0);
+    // Install HID host driver
+    const hid_host_driver_config_t hid_host_config = {
+        .create_background_task = true,
+        .task_priority = 5,
+        .stack_size = 8192,
+        .callback = hid_host_device_callback,
+        .callback_arg = NULL
+    };
+    ESP_ERROR_CHECK(hid_host_install(&hid_host_config));
+    
+    // Create USB host task
+    xTaskCreate(usb_host_lib_task, "usb_host", 8192, NULL, 5, NULL);
+
+    xTaskCreate(keyboard_watchdog_task, "kbd_watchdog", 8192, NULL, 4, NULL);
 
     // Initialize ESP-NOW
     init_espnow();
-    
-    // Start button task
-    xTaskCreate(button_task, "buttons", 4096, NULL, 5, NULL);
 }
