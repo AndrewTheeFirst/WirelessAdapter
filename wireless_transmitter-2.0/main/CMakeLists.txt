@@ -1,0 +1,22 @@
+idf_component_register(
+    SRCS 
+        "devices/keyboard.c"
+        "devices/mouse.c"
+        "hardware/hardware.c"
+        "wifi/wifi.c"
+        "main.c"
+    INCLUDE_DIRS
+        "."
+        "devices"
+        "hardware"
+        "wifi"
+        "sleep"
+    PRIV_REQUIRES
+        espressif__usb
+        espressif__usb_host_hid
+        esp_timer
+        esp_wifi
+        nvs_flash
+        esp_hw_support
+        wireless_shared
+)

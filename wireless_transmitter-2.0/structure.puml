@@ -1,0 +1,44 @@
+@startuml wireless-transmitter-2.0
+
+package wireless_shared{
+    file common.h
+    file msg_types.h
+}
+
+package main{
+    package devices{
+        file devices.h
+        file keyboard.c
+        file mouse.c
+        file gamepad.c
+    }
+
+    package hardware{
+        file hardware.h
+        file hardware.c
+    }
+
+    package wifi{
+        file wifi.h
+        file wifi.c
+    }
+
+    package sleep{
+        file sleep.h
+        file sleep.c
+    }
+    file main.c
+    file device_config.h
+}
+
+main --> wireless_shared
+
+hardware --> wifi
+hardware -> devices
+hardware --> sleep
+
+devices --> wifi
+
+main.c --> hardware
+
+@enduml
