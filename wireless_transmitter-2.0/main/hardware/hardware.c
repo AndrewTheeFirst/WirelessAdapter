@@ -96,7 +96,7 @@ static void hid_host_device_callback(hid_host_device_handle_t hid_device_handle,
 }
 
 // Event-loop to register Callbacks, Handle Enumeration, and enable the processing of HID Events 
-static void usb_host_lib_task(void *arg) {
+static void usbh_task(void *arg) {
     while (true) {
         uint32_t event_flags;
         usb_host_lib_handle_events(portMAX_DELAY, &event_flags);
@@ -104,8 +104,8 @@ static void usb_host_lib_task(void *arg) {
 }
 
 // Create USB host task and any other required setup
-void begin_usb_task(void){
-    xTaskCreate(usb_host_lib_task, "usb_host", 8192, NULL, 5, NULL);
+void begin_usbh_task(void){
+    xTaskCreate(usbh_task, "usb_host", 8192, NULL, 5, NULL);
     begin_keyboard_watchdog();
 }
 

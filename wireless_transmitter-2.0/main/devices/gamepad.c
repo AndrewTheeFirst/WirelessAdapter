@@ -228,6 +228,6 @@ static void process_gamepad_report(const uint8_t* data, size_t length) {
             break;
     }
     ESP_LOGI(TAG, "Gamepad Message Sent");
-    esp_now_send(receiver_mac, (uint8_t*)&msg, sizeof(msg));
+    esp_now_send(transmitter_peer_mac, (uint8_t*)&msg, sizeof(msg));
 }
 #endif

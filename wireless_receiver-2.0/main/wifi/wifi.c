@@ -6,12 +6,14 @@
 #include "esp_err.h"
 #include <string.h>
 #include "wifi.h"
+#include "device_config.h"
 
-static const char* TAG = "USB_TRANSMITTER // wifi.c";
+static const char* TAG = "USB_RECEIVER // wifi.c";
 
-static const uint8_t transmitter_peer_mac[6] = {0x10, 0x20, 0xBA, 0x4D, 0x3D, 0xCC};
+static const uint8_t transmitter_peer_mac[6] = {0x80, 0xB5, 0x4E, 0xDE, 0x45, 0x08};
 
 extern void app_process_message(const uint8_t* msg);
+
 // static bool connection_status = false;
 
 // ESP-NOW Callbacks
@@ -24,6 +26,7 @@ static void espnow_send_cb(const wifi_tx_info_t* tx_info, esp_now_send_status_t 
         (void)status;
     #endif
     (void)tx_info;
+    
 }
 
 // Initializes NVS, WIFI, ESP-NOW, and connects to peer
