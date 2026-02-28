@@ -2,7 +2,7 @@
 #include "freertos/queue.h" 
 #include "esp_log.h"
 #include "freertos/task.h"
-#include "msg_types.h"
+#include "wifi/msg_types.h"
 #include "tusb_device_common.h"
 #include "tusb.h"
 #include "freertos/task.h"

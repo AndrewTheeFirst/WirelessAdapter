@@ -1,9 +1,9 @@
-#include "msg_types.h"
+#include "wifi/msg_types.h"
 #include "usb/hid_usage_keyboard.h"
 #include "esp_task.h"
 #include "esp_log.h"
 #include "constants.h"
-#include "wifi.h"
+#include "wifi/wifi.h"
 #include <string.h>
 
 static const char* TAG = "USB_TRANSMITTER // keyboard.c";

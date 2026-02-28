@@ -1,5 +1,5 @@
 #include "usb/hid_usage_mouse.h"
-#include "msg_types.h"
+#include "wifi/msg_types.h"
 #include "stddef.h"
 #include "esp_err.h"
 

@@ -3,14 +3,11 @@ idf_component_register(
         "devices/keyboard.c"
         "devices/mouse.c"
         "hardware/hardware.c"
-        "wifi/wifi.c"
         "main.c"
-    INCLUDE_DIRS
+    PRIV_INCLUDE_DIRS
         "."
         "devices"
         "hardware"
-        "wifi"
-        "sleep"
     PRIV_REQUIRES
         espressif__usb
         espressif__usb_host_hid

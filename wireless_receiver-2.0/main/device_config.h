@@ -1,3 +1,4 @@
 #include "constants.h"
 
-#define DEBUG_WIFI ENABLED
+#define UPDATE_CONN_INTERVAL (10000ULL)
+#define DEBUG_WIFI DISABLED

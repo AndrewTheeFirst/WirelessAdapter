@@ -1,16 +1,14 @@
 idf_component_register(
     SRCS 
         "main.c"
-        "wifi/wifi.c"
         "devices/keyboard.c"
         "devices/mouse.c"
         "devices/devices.c"
         "tusb/tusb_cb.c"
         "hardware/hardware.c"
 
-    INCLUDE_DIRS
+    PRIV_INCLUDE_DIRS
         "."
-        "wifi"
         "tusb"
         "devices"
         "hardware"
@@ -18,6 +16,7 @@ idf_component_register(
         wireless_shared
         nvs_flash
         esp_wifi
+        esp_timer
         tinyusb
         usb
 )

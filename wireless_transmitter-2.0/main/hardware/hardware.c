@@ -1,9 +1,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
-#include "wifi.h"
+#include "wifi/wifi.h"
 #include "devices.h"
-#include "sleep.h"
+// #include "sleep.h"
 
 #define HID_INTERFACE_PROTOCOL_NONE     0
 #define HID_INTERFACE_PROTOCOL_KEYBOARD 1

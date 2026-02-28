@@ -1,0 +1,52 @@
+@startuml wireless-receiver-2.0
+
+package wireless_shared{
+    file common.h
+    file msg_types.h
+}
+
+package main{
+    package devices{
+        file devices.h
+        file devices.c
+        file keyboard.c
+        file keyboard.h
+        file mouse.c
+        file mouse.h
+    }
+
+    package hardware{
+        file hardware.h
+        file hardware.c
+    }
+
+    package wifi{
+        file wifi.h
+        file wifi.c
+    }
+
+    package tusb{
+        file tusb_cb.c
+        file tusb_cb.h
+        file tusb_config.h
+        file tusb_device_common.h
+    }
+    file main.c
+    file device_config.h
+}
+tusb_cb.c-->tusb_cb.h
+
+wifi.c->wifi.h
+
+main.c-->wifi
+main.c->hardware
+main.c-->devices
+main.c-->tusb
+
+devices.c-->keyboard.h
+devices.c-->mouse.h
+devices.c->devices.h
+
+main-->wireless_shared
+
+@enduml

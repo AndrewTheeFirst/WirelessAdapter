@@ -1,5 +1,5 @@
 #pragma once
-#include "msg_types.h"
+#include "wifi/msg_types.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 

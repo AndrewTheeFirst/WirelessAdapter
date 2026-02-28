@@ -1,6 +1,6 @@
 #pragma once
 #include <stdint.h>
-#include "msg_types.h"
+#include "wifi/msg_types.h"
 #include "esp_err.h"
 
 void init_device_queues(void);
