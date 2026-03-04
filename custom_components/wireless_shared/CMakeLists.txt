@@ -1,6 +1,6 @@
 idf_component_register(
     SRCS 
-        "include/wifi/wifi.c"
+        "include/src/wifi.c"
     INCLUDE_DIRS
         "include"
     PRIV_REQUIRES

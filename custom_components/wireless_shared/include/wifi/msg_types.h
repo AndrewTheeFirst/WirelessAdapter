@@ -13,6 +13,7 @@ typedef enum {
     ESPNOW_MSG_ACK,
     ESPNOW_MSG_START_RTT,
     ESPNOW_MSG_END_RTT,
+    ESPNOW_MSG_PAIR_REQUEST,
     ESPNOW_MSG_BLANK
 } __espnow_msg_type_t;
 

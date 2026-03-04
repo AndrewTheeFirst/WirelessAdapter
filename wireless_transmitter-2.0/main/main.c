@@ -23,11 +23,11 @@ void benchmark_task(void* arg){
 }
 #endif
 
-void app_process_message(const uint8_t* msg){
+void process_message_cb(const espnow_message_t* msg){
 #if BENCHMARK
     time_end = esp_timer_get_time();
 #endif
-    switch(((espnow_message_t*)msg)->msg_type){
+    switch(msg->msg_type){
 #if BENCHMARK
         case ESPNOW_MSG_END_RTT:
             ESP_LOGI(TAG, "RRT: %lld US", (time_end - time_start));
@@ -38,23 +38,20 @@ void app_process_message(const uint8_t* msg){
     }
 }
 
-void __print_connection_status(void* arg){
-    while(true){
-        ESP_LOGI(TAG, "Connection Status: %s", get_connection_status() ? "Connected" : "Not Connected");
-        vTaskDelay(pdMS_TO_TICKS(5000));
-    }
+void connection_status_cb(bool connection_status){
+    ESP_LOGI(TAG, "Connection: %s", connection_status ? "CONNECTED" : "DISCONNECTED");
 }
-
-void print_connection_status(void){
-    xTaskCreate(__print_connection_status, "print_connection_status", 4096, NULL, 4, NULL);
+void paired_status_updated_cb(bool paired_status){
+    ESP_LOGI(TAG, "Paired: %s", paired_status ? "YES" : "NO");
+    if (!paired_status)
+        begin_pairing_task();
 }
 
 void app_main(void){
     init_phy();
-    set_peer_mac((uint8_t[]){0x10, 0x20, 0xBA, 0x4D, 0x3D, 0xCC});
-    connect_to_peer();
+    start_espnow();
+    unpair();
     begin_usbh_task();
-    print_connection_status();
 #if BENCHMARK
     xTaskCreate(benchmark_task, "benchmark_task", 4096, NULL, 4, NULL);
 #endif
