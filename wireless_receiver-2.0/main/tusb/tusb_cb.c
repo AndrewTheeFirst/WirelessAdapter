@@ -1,7 +1,6 @@
 #include "devices.h"
 #include "esp_log.h"
 #include "tusb.h"
-#include "tusb_cb.h"
 #include "tusb_device_common.h"
 #include <string.h>
 
