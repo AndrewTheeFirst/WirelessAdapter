@@ -16,4 +16,5 @@ idf_component_register(
         nvs_flash
         esp_hw_support
         wireless_shared
+        driver
 )
