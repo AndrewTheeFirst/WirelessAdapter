@@ -65,7 +65,7 @@ static void keyboard_watchdog_task(void* arg) {
 }
 
 void begin_keyboard_watchdog(void){
-    xTaskCreate(keyboard_watchdog_task, "kbd_watchdog", 8192, NULL, 4, NULL);
+    xTaskCreate(keyboard_watchdog_task, "kbd_watchdog", 8192, NULL, 4, &kbd_wd_task_handle);
 }
 
 // parse a keyboard input-report and return a formatted espnow_message
