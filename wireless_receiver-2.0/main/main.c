@@ -24,7 +24,6 @@ void process_message_cb(const espnow_message_t* esp_msg){
         case ESPNOW_MSG_START_RTT:
             static const espnow_msg_blank_t packet = { .msg_type = ESPNOW_MSG_END_RTT };
             send_message((uint8_t*)&packet, sizeof(packet));
-            // enqueue_gamepad_event(esp_msg->gamepad_msg);
             break;
         default:
             ESP_LOGI(TAG, "Unknown Format: %d", esp_msg->msg_type);
@@ -39,12 +38,11 @@ void paired_status_updated_cb(bool paired_status){
 }
 
 void app_main(void){
+    start_espnow();
+    unpair(); // strictly for testing
+    begin_pairing_task();
     init_device_queues();
     begin_device_tasks();
-    start_espnow();
-    unpair();
-    begin_pairing_task();
-    // set_new_peer((uint8_t[]){0x80, 0xB5, 0x4E, 0xDE, 0x45, 0x08});
     init_phy();
     ESP_ERROR_CHECK(begin_usb_tud());
     wait_for_mount();

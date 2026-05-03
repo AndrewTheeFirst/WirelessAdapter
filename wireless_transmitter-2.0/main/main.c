@@ -10,6 +10,11 @@
 
 #define LED_PIN GPIO_NUM_15
 
+#define LOW_LOAD ENABLED
+#define MED_LOAD DISABLED
+#define HIGH_LOAD DISABLED
+
+
 static const char* TAG = "USB_TRANSMITTER // main.c";
 
 #if BENCHMARK
@@ -21,10 +26,19 @@ void benchmark_task(void* arg){
         if (send_message((uint8_t*)&packet, sizeof(packet)) == ESP_OK){
             time_start = esp_timer_get_time();
         }
-        vTaskDelay(pdMS_TO_TICKS(15000UL));
+#if LOW_LOAD
+            vTaskDelay(pdMS_TO_TICKS(LOW_LOAD_DEL_MS));
+#endif
+#if MED_LOAD
+            vTaskDelay(pdMS_TO_TICKS(MED_LOAD_DEL_MS));
+#endif
+#if HIGH_LOAD
+            vTaskDelay(pdMS_TO_TICKS(HIGH_LOAD_DEL_MS));
+#endif
     }
 }
 #endif
+
 
 void process_message_cb(const espnow_message_t* msg){
 #if BENCHMARK
@@ -84,7 +98,7 @@ void paired_status_updated_cb(bool paired_status){
 void app_main(void){
     init_phy();
     start_espnow();
-    unpair();
+    unpair(); // strictly for testing
     begin_usbh_task();
 #if BENCHMARK
     xTaskCreate(benchmark_task, "benchmark_task", 4096, NULL, 4, NULL);

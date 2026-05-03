@@ -40,7 +40,6 @@ static esp_err_t process_input_report(hid_host_device_handle_t hid_device_handle
         }
     
         if (formatted_data != NULL){
-            ESP_LOGI(TAG, "Attempting to send message...");
             ret_val = send_message(formatted_data, formatted_length);
             free(formatted_data);
         }
